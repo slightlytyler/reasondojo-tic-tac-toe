@@ -1,23 +1,30 @@
+type gridCell = Common.gridCell;
+
 /* Type representing a grid cell */
-type gridCell =
-  | X
-  | O
-  | Empty;
+module Client = BsSocket.Client.Make(Common);
 
 /* State declaration.
    The grid is a simple linear list.
    The turn uses a gridCell to figure out whether it's X or O's turn.
    The winner will be a list of indices which we'll use to highlight the grid when someone won. */
 type state = {
+  client: Client.t,
   grid: list(gridCell),
   turn: gridCell,
   winner: option(list(int)),
+  you: option(gridCell),
 };
 
 /* Action declaration */
 type action =
+  | Connect(gridCell)
+  | Move(int)
   | Restart
   | Click(int);
+
+let handleMove = (client, pos) => Client.emit(client, Common.Move, pos);
+
+let handleRestart = client => Client.emit(client, Common.InitRestart, ());
 
 /* Component template declaration.
    Needs to be **after** state and action declarations! */
@@ -29,18 +36,23 @@ let px = x => string_of_int(x) ++ "px";
 /* Main function that creates a component, which is a simple record.
    `component` is the default record, of which we overwrite initialState, reducer and render.
    */
-let make = (~you, _children) => {
+let make = _children => {
   /* spread the other default fields of component here and override a few */
   ...component,
   initialState: () => {
+    client: Client.create(),
     grid: [Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty],
     turn: X,
     winner: None,
+    you: None,
   },
   /* State transitions */
   reducer: (action, state) =>
-    switch (state, action) {
-    | ({turn, grid}, Click(cell)) =>
+    switch (action) {
+    | Connect(you) => ReasonReact.Update({...state, you: Some(you)})
+    | Click(cell)
+    | Move(cell) =>
+      let {grid, turn} = state;
       /* Apply the action to the grid first, then we check if this new grid is in a winning state. */
       let newGrid =
         List.mapi(
@@ -92,18 +104,39 @@ let make = (~you, _children) => {
         } else {
           None;
         };
-        /* Return new winner, new turn and new grid. */
-      ReasonReact.Update({winner, turn: turn === X ? O : X, grid: newGrid});
-    | (_, Restart) =>
+      /* Return new winner, new turn and new grid. */
+      ReasonReact.Update({
+        ...state,
+        winner,
+        turn: turn === X ? O : X,
+        grid: newGrid,
+      });
+    | Restart =>
       /* Reset the entire state */
       ReasonReact.Update({
+        ...state,
         grid: [Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty, Empty],
         turn: X,
         winner: None,
       })
     },
+  didMount: self => {
+    Client.emit(self.state.client, Common.ClientConnect, ());
+    Client.on(
+      self.state.client,
+      Common.ServerConnect,
+      you => {
+        Js.log2("you are", Common.gridCellToString(you));
+        self.send(Connect(you));
+      },
+    );
+    Client.on(self.state.client, Common.Move, pos => self.send(Move(pos)));
+    Client.on(self.state.client, Common.RolloutRestart, () =>
+      self.send(Restart)
+    );
+  },
   render: self => {
-    let yourTurn = you == self.state.turn;
+    let yourTurn = self.state.you == Some(self.state.turn);
     let message =
       switch (self.state.winner) {
       | None => yourTurn ? "Your turn" : "Their turn"
@@ -134,7 +167,7 @@ let make = (~you, _children) => {
               (),
             )
           )
-          onClick=(_event => self.send(Restart))>
+          onClick=(_event => handleRestart(self.state.client))>
           (string("Restart"))
         </button>
         <div
@@ -158,7 +191,7 @@ let make = (~you, _children) => {
                 List.mapi(
                   (i, piece) => {
                     let (txt, canClick) =
-                      switch (piece) {
+                      switch ((piece: gridCell)) {
                       | Empty => (" ", true)
                       | X => ("X", false)
                       | O => ("O", false)
@@ -169,7 +202,9 @@ let make = (~you, _children) => {
                       | Some(winner) =>
                         let isCurrentCellWinner = List.mem(i, winner);
                         if (isCurrentCellWinner
-                            && List.nth(self.state.grid, i) == you) {
+                            &&
+                            Some(List.nth(self.state.grid, i)) == self.state.
+                                                                    you) {
                           "green";
                         } else if (isCurrentCellWinner) {
                           "red";
@@ -177,12 +212,17 @@ let make = (~you, _children) => {
                           "white";
                         };
                       };
-                      /* We check if the user can click here so we can hide the cursor: pointer. */
+                    /* We check if the user can click here so we can hide the cursor: pointer. */
                     let canClick =
                       canClick && yourTurn && self.state.winner == None;
                     <div
                       key=(string_of_int(i))
-                      onClick=(_event => canClick ? self.send(Click(i)) : ())
+                      onClick=(
+                        _event =>
+                          if (canClick) {
+                            handleMove(self.state.client, i);
+                          }
+                      )
                       style=(
                         ReactDOMRe.Style.make(
                           ~display="flex",
